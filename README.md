@@ -20,8 +20,8 @@ Start a terminal conversation:
 
 Type `exit` to end. History lives only in this conversation process; restarting
 starts a new conversation. `chat_turn(graph, text, state)` returns the next state.
-For the upcoming Streamlit UI, keep that state in each user's `st.session_state`
-and pass `dict(st.secrets)` into `create_graph(settings=...)` on deployment.
+The Streamlit UI in `app.py` keeps that state in each user's `st.session_state`
+and passes `dict(st.secrets)` into `create_graph(settings=...)` on deployment.
 There is no globally shared customer history.
 
 Implemented: typed LangChain search tool, LangGraph model/tool loop, clarifying
@@ -30,7 +30,7 @@ caps, Gemini/OpenAI failover, bounded request timeouts and graph steps.
 Fallback retries the same current context and remains selected for that session.
 A missing Gemini key allows OpenAI-only operation. No keys gives a clear setup error.
 
-Not yet implemented: live Nawy search, Streamlit UI, persistent conversation history.
+Not yet integrated into the agent: live Nawy search. Persistent conversation history is not implemented.
 The agent must disclose no local matches instead of claiming a web search.
 
 Run offline checks:
@@ -44,3 +44,15 @@ References:
 - https://docs.langchain.com/oss/python/integrations/chat/google_generative_ai
 - https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
 - https://developers.openai.com/api/docs/models/gpt-4.1-mini
+
+## Streamlit session memory
+
+Run `.venv/bin/python -m streamlit run app.py` from the project directory.
+Each browser session keeps its own graph, internal agent state, and visible messages.
+Successful turns preserve previous context across Streamlit reruns. Failed turns
+leave previous history untouched. The New conversation button clears only the
+current session and resets provider selection. No conversation is written to SQLite.
+Reloading the page or restarting the server may end the session; there is no
+permanent conversation history.
+
+Test session isolation and resets with `.venv/bin/python -m unittest -v test_app.py`.

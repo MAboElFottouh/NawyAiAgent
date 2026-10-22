@@ -2,7 +2,7 @@
 import json
 import math
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 
 import database
 
@@ -40,7 +40,7 @@ def search_properties(*, property_type=None, location=None, compound=None,
                       target_price=None, target_area_m2=None,
                       price_tolerance=0.10,
                       bedrooms=None, bathrooms=None, payment_method=None,
-                      max_down_payment=None, limit=5):
+                      max_down_payment=None, limit=5, _connection=None, _limit_cap=20):
     """Search stored listings without an LLM or network access.
 
     Prices/down payments are EGP. Bedrooms, bathrooms and target area are minima.
@@ -58,7 +58,7 @@ def search_properties(*, property_type=None, location=None, compound=None,
         _number(value, name)
     for name, value in {'bedrooms': bedrooms, 'bathrooms': bathrooms, 'limit': limit}.items():
         _number(value, name, integer=True)
-    if limit is None or not 1 <= limit <= 20:
+    if limit is None or not 1 <= limit <= _limit_cap:
         raise ValueError('limit must be between 1 and 20.')
     for low, high in [(min_price, max_price), (min_area_m2, max_area_m2)]:
         if low is not None and high is not None and low > high:
@@ -127,7 +127,8 @@ def search_properties(*, property_type=None, location=None, compound=None,
     order = (' + '.join(distances) + ', ') if distances else ''
     order += 'p.price IS NULL, p.price, p.id'
     # mode=ro prevents accidentally creating an empty database on deployment.
-    with closing(sqlite3.connect(database.DB_PATH.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+    with (nullcontext(_connection) if _connection is not None else
+          closing(sqlite3.connect(database.DB_PATH.resolve().as_uri() + '?mode=ro', uri=True))) as conn:
         conn.row_factory = sqlite3.Row
         total = conn.execute(f'SELECT COUNT(*) FROM properties p WHERE {where}', params).fetchone()[0]
         rows = conn.execute(f'SELECT p.* FROM properties p WHERE {where} '
@@ -144,3 +145,37 @@ def search_properties(*, property_type=None, location=None, compound=None,
         properties.append(prop)
     return {'source': 'sqlite', 'total_matches': total, 'applied_filters': applied_filters,
             'properties': properties}
+
+
+def nearby_properties(**filters):
+    """Relax preferences only; keep location, type, payment and explicit hard bounds."""
+    exact = search_properties(**filters)
+    if exact['total_matches']:
+        return {**exact, 'match_type': 'exact'}
+    relaxed = {k: v for k, v in filters.items() if k not in
+               ('target_price', 'target_area_m2', 'bedrooms', 'bathrooms', 'limit')}
+    pool = search_properties(**relaxed, limit=1000, _limit_cap=1000)['properties']
+    ranked = []
+    for prop in pool:
+        differences, score = [], 0.0
+        checks = [('price', filters.get('target_price'), prop.get('max_price', prop.get('price')), 'maximum'),
+                  ('area_m2', filters.get('target_area_m2'), prop.get('area_m2'), 'minimum'),
+                  ('bedrooms', filters.get('bedrooms'), prop.get('bedrooms'), 'minimum'),
+                  ('bathrooms', filters.get('bathrooms'), prop.get('bathrooms'), 'minimum')]
+        for field, requested, actual, kind in checks:
+            if requested is None:
+                continue
+            bound = round(requested * (1 + filters.get('price_tolerance', 0.10)), 2) if field == 'price' else requested
+            if actual is None:
+                differences.append({'field': field, 'required': bound, 'actual': None, 'reason': 'unknown'})
+                score += 10
+                continue
+            score += abs(actual - requested) / max(requested, 1)
+            if (kind == 'maximum' and actual > bound) or (kind == 'minimum' and actual < bound):
+                differences.append({'field': field, 'required': bound, 'actual': actual, 'reason': kind})
+                score += 1
+        ranked.append((score, prop['id'], {**prop, 'differences': differences}))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return {'source': 'sqlite', 'match_type': 'alternative', 'total_matches': 0,
+            'properties': [item[2] for item in ranked[:min(filters.get('limit', 5), 5)]],
+            'note': 'Alternatives are not exact matches. Explicit hard bounds remain enforced.'}

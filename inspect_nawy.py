@@ -155,7 +155,7 @@ def save_state(state, property_record=None):
 
 def load_state():
     database.init_db()
-    state = database.load_checkpoint()
+    state = database.load_checkpoint(ids_only=True)
     state.update(source_url=SEARCH_URL, requested_count=LIMIT)
     state.setdefault("next_page", 1)
     return state
@@ -218,15 +218,19 @@ def collect(state, fetcher):
             print("No more search results are available.", flush=True)
             save_state(state)
             return 1
+        # Refresh IDs before detail requests, including units saved by other tools.
+        saved_ids.update(database.get_property_ids())
+        state["properties"] = [{"id": int(pid)} for pid in saved_ids]
         for result in results:
             if len(saved_ids) >= LIMIT:
                 break
             if str(result["id"]) in saved_ids:
+                print(f"Skipping {result['id']}: already in SQLite (no detail request).", flush=True)
                 continue
             url = property_url(result)
             print(f"[{len(saved_ids) + 1}/{LIMIT}] Fetching {result['id']}...", flush=True)
             prop = extract_property(fetcher.get(url), url, result["id"])
-            state["properties"].append(prop)
+            state["properties"].append({"id": prop["id"]})
             saved_ids.add(str(prop["id"]))
             state.pop("last_error", None)
             state.pop("retry_not_before", None)

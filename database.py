@@ -60,13 +60,20 @@ def save_checkpoint(state, property_record=None):
                      (json.dumps(metadata, ensure_ascii=False),))
 
 
-def load_checkpoint():
+def get_property_ids():
+    """Read only IDs for fast duplicate checks before requesting detail pages."""
+    with closing(connect()) as conn:
+        return {str(row[0]) for row in conn.execute("SELECT id FROM properties")}
+
+
+def load_checkpoint(ids_only=False):
     with closing(connect()) as conn:
         row = conn.execute('SELECT data FROM scrape_state WHERE id=1').fetchone()
         state = json.loads(row['data']) if row else {}
         properties = []
-        for row in conn.execute('SELECT * FROM properties ORDER BY id'):
-            prop = {key: row[key] for key in FIELDS if row[key] is not None}
+        query = 'SELECT id FROM properties ORDER BY id' if ids_only else 'SELECT * FROM properties ORDER BY id'
+        for row in conn.execute(query):
+            prop = {key: row[key] for key in row.keys() if key in FIELDS and row[key] is not None}
             for key in JSON_FIELDS:
                 if key in prop:
                     prop[key] = json.loads(prop[key])

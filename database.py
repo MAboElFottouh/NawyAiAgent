@@ -84,18 +84,69 @@ def load_checkpoint(ids_only=False):
         state['properties'] = properties
         return state
 
+FACET_COLUMNS = ('property_type', 'compound', 'developer', 'location')
+def get_distinct_facets():
+    """Return sorted unique non-empty values for common search dimensions."""
+    facets = {}
+    with closing(connect()) as conn:
+        for column in FACET_COLUMNS:
+            rows = conn.execute(
+                f'SELECT DISTINCT {column} FROM properties '
+                f'WHERE {column} IS NOT NULL AND TRIM({column}) != \'\' '
+                f'ORDER BY {column} COLLATE NOCASE'
+            )
+            facets[column] = [row[0] for row in rows]
+    return facets
 
-def import_json(path):
-    """One-time, atomic import; reruns never overwrite newer database records."""
-    payload = json.loads(Path(path).read_text(encoding='utf-8'))
-    properties = payload['properties']
-    timestamp = payload.get('updated_at') or payload.get('scraped_at') or datetime.now(timezone.utc).isoformat()
-    metadata = {k: v for k, v in payload.items() if k != 'properties'}
-    init_db()
-    with closing(connect()) as conn, conn:
-        for prop in properties:
-            if conn.execute('SELECT 1 FROM properties WHERE id=?', (prop['id'],)).fetchone() is None:
-                _upsert(conn, prop, timestamp)
-        metadata['scraped_count'] = conn.execute('SELECT COUNT(*) FROM properties').fetchone()[0]
-        conn.execute('INSERT OR IGNORE INTO scrape_state VALUES (1, ?)', (json.dumps(metadata, ensure_ascii=False),))
-    return len(properties)
+# print(get_distinct_facets()['property_type'])
+# print("--------------------------------")
+# print(get_distinct_facets()['compound'])
+# print("--------------------------------")
+# print(get_distinct_facets()['developer'])
+# print("--------------------------------")
+# print(get_distinct_facets()['location'])    
+
+
+
+def inventory_summary():
+    """Read current listing coverage and EGP bounds without caching or writes."""
+    with closing(sqlite3.connect(DB_PATH.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, location, parent_location, property_type, finishing, updated_at,
+                   COALESCE(min_price, price) AS low,
+                   COALESCE(max_price, price) AS high,
+                   EXISTS (SELECT 1 FROM json_each(payment_plans) plan
+                           WHERE json_extract(plan.value, '$.currency') = 'EGP') AS is_egp
+            FROM properties WHERE on_sale = 1 OR on_sale IS NULL
+        """).fetchall()
+
+    def bucket():
+        return {'listing_count': 0, 'priced_egp_count': 0, 'min_price_egp': None, 'max_price_egp': None}
+
+    def add(group, row):
+        group['listing_count'] += 1
+        if row['is_egp'] and row['low'] is not None and row['high'] is not None and row['low'] > 0 and row['high'] >= row['low']:
+            group['priced_egp_count'] += 1
+            group['min_price_egp'] = row['low'] if group['min_price_egp'] is None else min(group['min_price_egp'], row['low'])
+            group['max_price_egp'] = row['high'] if group['max_price_egp'] is None else max(group['max_price_egp'], row['high'])
+
+    overall, areas, types = bucket(), {}, {}
+    for row in rows:
+        add(overall, row)
+        kind = row['property_type'] or 'Unknown'
+        add(types.setdefault(kind, bucket()), row)
+        # Parent area buckets include their neighborhoods, just like local search.
+        names = {name.strip() for name in (row['location'], row['parent_location']) if name and name.strip()}
+        for name in names:
+            area = areas.setdefault(name, {**bucket(), 'property_types': {}})
+            add(area, row)
+            add(area['property_types'].setdefault(kind, bucket()), row)
+    return {
+        'status': 'ok', 'source': 'local_sqlite',
+        'scope': 'Stored listings only, not market-wide availability. Area totals may overlap through parent areas.',
+        'last_listing_update': max((row['updated_at'] for row in rows), default=None),
+        'overall': overall, 'property_types': dict(sorted(types.items())),
+        'finishing_options': sorted({row['finishing'] for row in rows if row['finishing']}),
+        'locations': dict(sorted(areas.items())),
+    }

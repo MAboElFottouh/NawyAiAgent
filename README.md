@@ -56,3 +56,21 @@ Reloading the page or restarting the server may end the session; there is no
 permanent conversation history.
 
 Test session isolation and resets with `.venv/bin/python -m unittest -v test_app.py`.
+
+## Conversation and search policy
+
+The English system prompt follows the customer's latest language and asks one combined
+completion question. Unanswered optional preferences are omitted after the reply.
+Explicit requests to search immediately skip that question. Changed/cancelled filters
+must be reflected in a fresh search.
+
+Search returns five results by default or the requested count, limited by available
+inventory. Finishing and latest delivery date are supported when explicitly supplied.
+Rooms and area remain minimum requirements. Exact results respect final budget caps.
+If no exact results exist, the tool returns ranked, clearly labelled alternatives with
+per-property differences; those alternatives may cross location or budget constraints.
+They never replace the original requirements. No web-search tool is enabled or offered.
+
+Run the policy regressions with `.venv/bin/python -m unittest -v test_search_policy.py`.
+Model phrasing and clarification behavior are prompt-guided; deterministic filter and
+alternative behavior are covered by local tests.

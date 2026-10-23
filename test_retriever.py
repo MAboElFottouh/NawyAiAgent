@@ -79,7 +79,7 @@ class SearchTests(unittest.TestCase):
                 search_properties(**filters)
 
     def test_invalid_filters(self):
-        for filters in [dict(min_price=10, max_price=1), dict(limit=100), dict(max_price=float('nan')),
+        for filters in [dict(min_price=10, max_price=1), dict(limit=0), dict(max_price=float('nan')),
                         dict(bedrooms=-1), dict(payment_method='invalid')]:
             with self.assertRaises(ValueError):
                 search_properties(**filters)

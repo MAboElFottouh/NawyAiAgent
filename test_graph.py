@@ -29,7 +29,7 @@ class GraphTests(unittest.TestCase):
         primary = FakeModel([call, TimeoutError('secret body must never be shown')])
         backup = FakeModel([AIMessage(content='نتائج'), AIMessage(content='تمام')])
         app = build_graph([('google_genai', primary), ('openai', backup)])
-        with patch('graph.search_properties', return_value={'total_matches': 0, 'properties': []}) as search:
+        with patch('graph.search_properties', return_value={'total_matches': 1, 'properties': []}) as search:
             state = chat_turn(app, 'عايز شقة بحوالي ٧ مليون ومساحة ١٥٠')
         self.assertEqual(search.call_args.kwargs['target_price'], 7000000)
         self.assertEqual(state['provider'], 'openai')

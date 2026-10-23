@@ -1,6 +1,7 @@
 """Read-only, parameterized property search; usable by a future LangChain tool."""
 import json
 import math
+from datetime import date
 import sqlite3
 from contextlib import closing, nullcontext
 
@@ -9,7 +10,7 @@ import database
 TYPE_ALIASES = {'شقة': 'Apartment', 'شقه': 'Apartment', 'فيلا': 'Villa',
                 'ڤيلا': 'Villa', 'تاون هاوس': 'Townhouse', 'توين هاوس': 'Twinhouse',
                 'شاليه': 'Chalet', 'استوديو': 'Studio', 'مكتب': 'Office'}
-LOCATION_ALIASES = {'القاهرة الجديدة': 'New Cairo', 'القاهره الجديده': 'New Cairo',
+LOCATION_ALIASES = {'NewCairo': 'New Cairo', 'newcairo': 'New Cairo', 'القاهرة الجديدة': 'New Cairo', 'القاهره الجديده': 'New Cairo',
                     'الشيخ زايد': 'El Sheikh Zayed', 'زايد الجديدة': 'New Zayed',
                     'العاصمة الإدارية': 'New Capital City', 'العاصمه الاداريه': 'New Capital City',
                     'العين السخنة': 'Ain Sokhna', 'العين السخنه': 'Ain Sokhna',
@@ -40,7 +41,7 @@ def search_properties(*, property_type=None, location=None, compound=None,
                       target_price=None, target_area_m2=None,
                       price_tolerance=0.10,
                       bedrooms=None, bathrooms=None, payment_method=None,
-                      max_down_payment=None, limit=5, _connection=None, _limit_cap=20):
+                      max_down_payment=None, finishing=None, delivery_by=None, limit=5, _connection=None, _limit_cap=None):
     """Search stored listings without an LLM or network access.
 
     Prices/down payments are EGP. Bedrooms, bathrooms and target area are minima.
@@ -58,8 +59,12 @@ def search_properties(*, property_type=None, location=None, compound=None,
         _number(value, name)
     for name, value in {'bedrooms': bedrooms, 'bathrooms': bathrooms, 'limit': limit}.items():
         _number(value, name, integer=True)
-    if limit is None or not 1 <= limit <= _limit_cap:
-        raise ValueError('limit must be between 1 and 20.')
+    if limit is None or limit < 1:
+        raise ValueError('limit must be a positive integer.')
+    if delivery_by is not None:
+        if not isinstance(delivery_by, str):
+            raise ValueError('delivery_by must be an ISO date (YYYY-MM-DD).')
+        date.fromisoformat(delivery_by)
     for low, high in [(min_price, max_price), (min_area_m2, max_area_m2)]:
         if low is not None and high is not None and low > high:
             raise ValueError('Minimum cannot exceed maximum.')
@@ -92,6 +97,12 @@ def search_properties(*, property_type=None, location=None, compound=None,
     if compound is not None:
         clauses.append("p.compound LIKE ? ESCAPE '\\'")
         params.append(_like(_text(compound)))
+    if finishing is not None:
+        clauses.append('p.finishing = ? COLLATE NOCASE')
+        params.append(_text(finishing))
+    if delivery_by is not None:
+        clauses.append('date(p.delivery_date) <= date(?)')
+        params.append(delivery_by)
     for expression, operator, value in [
         ('COALESCE(p.min_price, p.price)', '>=', min_price),
         ('COALESCE(p.max_price, p.price)', '<=', max_price),
@@ -147,35 +158,58 @@ def search_properties(*, property_type=None, location=None, compound=None,
             'properties': properties}
 
 
-def nearby_properties(**filters):
-    """Relax preferences only; keep location, type, payment and explicit hard bounds."""
-    exact = search_properties(**filters)
+def nearby_properties(_exact_result=None, **filters):
+    """Rank non-matching alternatives without mutating the original filters."""
+    exact = _exact_result if _exact_result is not None else search_properties(**filters)
     if exact['total_matches']:
         return {**exact, 'match_type': 'exact'}
-    relaxed = {k: v for k, v in filters.items() if k not in
-               ('target_price', 'target_area_m2', 'bedrooms', 'bathrooms', 'limit')}
-    pool = search_properties(**relaxed, limit=1000, _limit_cap=1000)['properties']
+    count = search_properties(limit=1)['total_matches']
+    pool = search_properties(limit=max(count, 1))['properties']
+    groups = {
+        'property_type': ('property_type',), 'location': ('location',), 'compound': ('compound',),
+        'price': ('target_price', 'min_price', 'max_price'),
+        'area_m2': ('target_area_m2', 'min_area_m2', 'max_area_m2'),
+        'bedrooms': ('bedrooms',), 'bathrooms': ('bathrooms',),
+        'payment_plan': ('payment_method', 'max_down_payment'),
+        'finishing': ('finishing',), 'delivery_date': ('delivery_by',),
+    }
+    criteria = []
+    for label, keys in groups.items():
+        selected = {k: filters[k] for k in keys if filters.get(k) is not None}
+        if not selected:
+            continue
+        query = dict(selected)
+        if label == 'price':
+            query['price_tolerance'] = filters.get('price_tolerance', .1)
+        matches = search_properties(**query, limit=max(count, 1))['properties']
+        criteria.append((label, selected, {p['id'] for p in matches}))
     ranked = []
     for prop in pool:
-        differences, score = [], 0.0
-        checks = [('price', filters.get('target_price'), prop.get('max_price', prop.get('price')), 'maximum'),
-                  ('area_m2', filters.get('target_area_m2'), prop.get('area_m2'), 'minimum'),
-                  ('bedrooms', filters.get('bedrooms'), prop.get('bedrooms'), 'minimum'),
-                  ('bathrooms', filters.get('bathrooms'), prop.get('bathrooms'), 'minimum')]
-        for field, requested, actual, kind in checks:
-            if requested is None:
+        differences, distance = [], 0.0
+        for label, requested, matched_ids in criteria:
+            if prop['id'] in matched_ids:
                 continue
-            bound = round(requested * (1 + filters.get('price_tolerance', 0.10)), 2) if field == 'price' else requested
-            if actual is None:
-                differences.append({'field': field, 'required': bound, 'actual': None, 'reason': 'unknown'})
-                score += 10
-                continue
-            score += abs(actual - requested) / max(requested, 1)
-            if (kind == 'maximum' and actual > bound) or (kind == 'minimum' and actual < bound):
-                differences.append({'field': field, 'required': bound, 'actual': actual, 'reason': kind})
-                score += 1
-        ranked.append((score, prop['id'], {**prop, 'differences': differences}))
-    ranked.sort(key=lambda item: (item[0], item[1]))
+            if label == 'payment_plan':
+                actual = prop.get('payment_plans')
+            elif label == 'location':
+                actual = {'location': prop.get('location'), 'parent_location': prop.get('parent_location')}
+            elif label == 'price':
+                actual = {'price': prop.get('price'), 'min_price': prop.get('min_price'), 'max_price': prop.get('max_price')}
+            elif label == 'area_m2':
+                actual = {'area_m2': prop.get('area_m2'), 'max_area_m2': prop.get('max_area_m2')}
+            else:
+                actual = prop.get(label)
+            differences.append({'field': label, 'requested': requested, 'actual': actual,
+                                'reason': 'Does not satisfy the requested condition or cannot be verified.'})
+        for key, value in [('price', filters.get('target_price') or filters.get('max_price')),
+                           ('area_m2', filters.get('target_area_m2') or filters.get('min_area_m2')),
+                           ('bedrooms', filters.get('bedrooms')), ('bathrooms', filters.get('bathrooms'))]:
+            if value:
+                distance += abs(prop[key] - value) / value if prop.get(key) is not None else 10
+        ranked.append((len(differences), distance, prop['id'], {**prop, 'differences': differences}))
+    ranked.sort(key=lambda row: row[:3])
     return {'source': 'sqlite', 'match_type': 'alternative', 'total_matches': 0,
-            'properties': [item[2] for item in ranked[:min(filters.get('limit', 5), 5)]],
-            'note': 'Alternatives are not exact matches. Explicit hard bounds remain enforced.'}
+            'applied_filters': exact.get('applied_filters', {}),
+            'requested_filters': filters, 'available_alternatives': len(ranked),
+            'properties': [row[3] for row in ranked[:filters.get('limit', 5)]],
+            'note': 'Non-matching alternatives only. Original requirements have NOT changed.'}

@@ -150,3 +150,5 @@ def inventory_summary():
         'finishing_options': sorted({row['finishing'] for row in rows if row['finishing']}),
         'locations': dict(sorted(areas.items())),
     }
+
+

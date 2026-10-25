@@ -8,3 +8,4 @@ __pycache__/
 data/*.lock
 data/*-wal
 data/*-shm
+data/masterv_temp/

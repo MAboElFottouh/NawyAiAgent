@@ -9,3 +9,7 @@ data/*.lock
 data/*-wal
 data/*-shm
 data/masterv_temp/
+data/masterv.db
+data/masterv.db-journal
+data/masterv_rebuild.db*
+data/backups/

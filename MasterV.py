@@ -3,10 +3,14 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import sqlite3
+import time
+from contextlib import closing
 from pathlib import Path
 
 import requests
 from dotenv import dotenv_values
+from masterv_database import CITIES, save_city, save_details, DB_PATH
 
 
 LOGIN_URL = "https://newapi.masterv.net/api/v3/public/auth/login"
@@ -90,8 +94,8 @@ class MasterV:
         
         return self.auth
 
-    def fetch_cities(self, output_root: str | Path | None = None) -> Path:
-        """Send exactly one request per city (1–7), without retries or pagination."""
+    def data_headers(self) -> dict[str, str]:
+        """Shared authenticated headers for listing and detail requests."""
         if self.auth is None:
             raise MasterVError("Log in before fetching cities.")
         config = dotenv_values(self.env_path, interpolate=False)
@@ -114,47 +118,102 @@ class MasterV:
             "DataSectionId": "1",
             "SectionId": "",
         }
-        root = Path(output_root) if output_root is not None else ENV_PATH.parent / "data" / "masterv_temp"
-        output = root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        output.mkdir(parents=True, exist_ok=False)
-        manifest = {"created_at": datetime.now(timezone.utc).isoformat(), "cities": []}
-        for city_id in range(1, 8):
+        return headers
+
+    def fetch_cities(self, db_path: str | Path = DB_PATH) -> dict[int, int]:
+        """Fetch all city pages and upsert each complete city response."""
+        headers = self.data_headers()
+        counts, failures = {}, []
+        for city_id in CITIES:
             body = {**DATA_BODY, "DataCityId": [city_id]}
-            entry = {"city_id": city_id, "request": body, "success": False}
+            collected_at = datetime.now(timezone.utc).isoformat()
             try:
-                response = self.session.patch(DATA_URL, headers=headers, json=body,
-                                              timeout=(10, 60), allow_redirects=False)
-                entry["http_status"] = response.status_code
-                # Save the entire response, including API errors, before validation.
-                try:
-                    payload = response.json()
-                except ValueError:
-                    filename = f"city_{city_id}.bin"
-                    (output / filename).write_bytes(response.content)
-                    entry["file"] = filename
-                    raise MasterVError("Response is not valid JSON.") from None
-                filename = f"city_{city_id}.json"
-                (output / filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                entry["file"] = filename
-                if not (200 <= response.status_code < 300 and isinstance(payload, dict)
-                        and payload.get("error") is False and payload.get("code") == 200):
-                    raise MasterVError("API did not confirm success.")
-                data = payload.get("data")
-                results = data.get("results") if isinstance(data, dict) else None
-                if not isinstance(results, list):
-                    raise MasterVError("Response is missing data.results.")
-                entry["success"] = True
-                entry["count"] = len(results)
-                print(f"MasterV: City {city_id}: saved {len(results)} records.", flush=True)
-            except (requests.RequestException, MasterVError) as exc:
-                entry["error"] = str(exc) if isinstance(exc, MasterVError) else "Network, TLS, or timeout failure."
-                print(f"MasterV: City {city_id}: failed; see manifest.", flush=True)
-            manifest["cities"].append(entry)
-            (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"MasterV: Responses saved in {output}", flush=True)
-        if not all(entry["success"] for entry in manifest["cities"]):
-            raise MasterVError("Some cities failed. Saved responses were retained; no requests retried.")
-        return output
+                results, seen = [], set()
+                page = 1
+                while True:
+                    body["Page"] = page
+                    response = self.session.patch(DATA_URL, headers=headers, json=body,
+                                                  timeout=(10, 60), allow_redirects=False)
+                    if not 200 <= response.status_code < 300:
+                        raise MasterVError(f"HTTP {response.status_code}.")
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        raise MasterVError("Response is not valid JSON.") from None
+                    if not (isinstance(payload, dict) and payload.get("error") is False
+                            and payload.get("code") == 200):
+                        raise MasterVError("API did not confirm success.")
+                    data = payload.get("data")
+                    batch = data.get("results") if isinstance(data, dict) else None
+                    if not isinstance(batch, list):
+                        raise MasterVError("Response is missing data.results.")
+                    new_ids = {r["DataId"] for r in batch}
+                    if new_ids & seen:
+                        raise MasterVError("Pagination repeated project IDs.")
+                    seen.update(new_ids)
+                    results.extend(batch)
+                    total = int(batch[0]["TotalCount"]) if batch and batch[0].get("TotalCount") is not None else None
+                    if total is not None and len(results) >= total:
+                        break
+                    if not batch:
+                        if total is not None and len(results) < total:
+                            raise MasterVError("Incomplete city results.")
+                        break
+                    if total is None and len(batch) < body["Limit"]:
+                        break
+                    page += 1
+                counts[city_id] = save_city(city_id, results, collected_at, db_path)
+                print(f"MasterV: {CITIES[city_id]}: saved {counts[city_id]} records to database.", flush=True)
+            except (requests.RequestException, MasterVError, ValueError) as exc:
+                failures.append(city_id)
+                detail = str(exc) if isinstance(exc, (MasterVError, ValueError)) else "Network, TLS, or timeout failure."
+                print(f"MasterV: City {city_id}: {detail}", flush=True)
+        if failures:
+            raise MasterVError(f"Failed cities: {failures}. Successful cities were saved; no requests retried.")
+        return counts
+
+    def fetch_details(self, db_path: str | Path = DB_PATH, resume=False):
+        """Fetch details only when DataDeliveryFrom is not null (zero is allowed)."""
+        headers = self.data_headers()
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            projects = conn.execute("""SELECT * FROM projects
+                WHERE json_extract(raw_json, '$.DataDeliveryFrom') IS NOT NULL
+                AND (?=0 OR data_id NOT IN
+                    (SELECT data_id FROM detail_fetch_state WHERE status='success'))
+                ORDER BY city_id, data_id""", (int(resume),)).fetchall()
+        failures = []
+        for index, project in enumerate(projects, 1):
+            if index > 1:
+                time.sleep(5)
+            stop_status = None
+            try:
+                if project['compound_id'] is None or project['developer_id'] is None:
+                    raise MasterVError('Missing project identifiers.')
+                params = {'CompoundId': project['compound_id'], 'SectionId': 1,
+                          'DeveloperId': project['developer_id'], 'Currency': 1,
+                          'CityId': project['city_id'], 'ViewAll': 'True'}
+                response = self.session.get(DATA_URL, params=params, headers=headers,
+                                            timeout=(10, 60), allow_redirects=False)
+                if response.status_code != 200:
+                    if response.status_code in (401, 403, 429):
+                        stop_status = response.status_code
+                    raise MasterVError(f'HTTP {response.status_code}')
+                save_details(project['data_id'], response.json(), db_path)
+                print(f"Details {index}/{len(projects)}: {project['name']} saved", flush=True)
+            except (requests.RequestException, ValueError, KeyError, TypeError, sqlite3.Error, MasterVError) as exc:
+                failures.append(project['data_id'])
+                # Do not log request headers or credentials.
+                error = str(exc) if isinstance(exc, MasterVError) else type(exc).__name__
+                with closing(sqlite3.connect(db_path)) as conn, conn:
+                    conn.execute('INSERT OR REPLACE INTO detail_fetch_state VALUES (?,?,?,?)',
+                                 (project['data_id'],'failed',datetime.now(timezone.utc).isoformat(),error))
+                print(f"Details {index}/{len(projects)}: failed ({error})", flush=True)
+                if stop_status is not None:
+                    raise MasterVError(f'Stopped on HTTP {stop_status}; progress saved. Check source access before resuming.') from None
+        if failures:
+            raise MasterVError(f'{len(failures)} detail requests failed; progress saved for resuming.')
+        return len(projects)
 
     def close(self):
         self.session.close()
@@ -166,7 +225,9 @@ def main() -> int:
     try:
         client.login()
         print("MasterV: Login successful.", flush=True)
-        client.fetch_cities()
+        counts = client.fetch_cities()
+        print(f"MasterV: Stored {sum(counts.values())} records in the database.")
+        client.fetch_details()
     except MasterVError as exc:
         print(f"MasterV: {exc}")
         return 1
